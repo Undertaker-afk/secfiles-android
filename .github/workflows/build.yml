@@ -2,20 +2,39 @@ name: build
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
-      - uses: android-actions/setup-android@v3
-      - name: Core tests (crypto + filesystem)
-        run: ./gradlew :core:test
+          cache: gradle
+
+      # The runner image already ships the Android SDK (ANDROID_HOME). We only make sure the pieces this
+      # project needs are present, instead of using a third-party setup action.
+      - name: Install Android SDK components
+        run: |
+          SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n 1)"
+          echo "Using $SDKMANAGER"
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          set -o pipefail
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Core tests (crypto, compression, filesystem)
+        run: ./gradlew :core:test --no-daemon
+
       - name: Lint and build
-        run: ./gradlew :app:lintDebug :app:assembleDebug
+        run: ./gradlew :app:lintDebug :app:assembleDebug --no-daemon
+
       - uses: actions/upload-artifact@v4
         with:
           name: secfiles-debug-apk
