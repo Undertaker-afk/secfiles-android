@@ -3,12 +3,19 @@ on:
   push:
   pull_request:
 
-permissions:
-  contents: read
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Publishing a release needs write access; pull requests only ever get a read-only token anyway.
+    permissions:
+      contents: write
+    env:
+      BUILD_TOOLS: 35.0.0
+      # Optional signing secrets (Settings > Secrets and variables > Actions). Without them the release
+      # carries the debug-signed APK instead, clearly labelled.
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,15 +34,71 @@ jobs:
           set +o pipefail
           yes | "$SDKMANAGER" --licenses > /dev/null || true
           set -o pipefail
-          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+          "$SDKMANAGER" "platforms;android-35" "build-tools;$BUILD_TOOLS"
 
       - name: Core tests (crypto, compression, filesystem)
         run: ./gradlew :core:test --no-daemon
 
-      - name: Lint and build
-        run: ./gradlew :app:lintDebug :app:assembleDebug --no-daemon
+      - name: Lint and build (debug and release)
+        run: ./gradlew :app:lintDebug :app:assembleDebug :app:assembleRelease --no-daemon
+
+      - name: Collect test summary
+        id: tests
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import glob, re
+          t = f = 0
+          for p in glob.glob("core/build/test-results/test/*.xml"):
+              m = re.search(r'tests="(\d+)".*?failures="(\d+)" errors="(\d+)"', open(p).read())
+              t += int(m.group(1)); f += int(m.group(2)) + int(m.group(3))
+          print(f"summary={t} core tests, {f} failures")
+          PY
+
+      - name: Package APK
+        id: apk
+        run: |
+          VERSION="0.2.${{ github.run_number }}"
+          OUT="$RUNNER_TEMP/out"
+          mkdir -p "$OUT"
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS"
+            "$BT/zipalign" -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk "$RUNNER_TEMP/aligned.apk"
+            "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks" --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEYSTORE_PASSWORD \
+              --out "$OUT/SecFiles-$VERSION.apk" "$RUNNER_TEMP/aligned.apk"
+            "$BT/apksigner" verify "$OUT/SecFiles-$VERSION.apk"
+            rm -f "$RUNNER_TEMP/release.jks" "$RUNNER_TEMP/aligned.apk"
+            echo "signing=Signed release build (minified)." >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            cp app/build/outputs/apk/debug/app-debug.apk "$OUT/SecFiles-$VERSION-debug.apk"
+            echo "signing=No signing key is configured, so this is the unminified DEBUG build signed with a throwaway debug key. Updating from another build may require uninstalling first." >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "dir=$OUT" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: secfiles-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: secfiles-apk
+          path: ${{ steps.apk.outputs.dir }}/*.apk
+
+      # Every push that got this far (tests, lint and build all passed) becomes a release.
+      - name: Publish GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          FLAGS=""
+          if [ "${{ steps.apk.outputs.prerelease }}" = "true" ]; then FLAGS="--prerelease"; fi
+          SUBJECT="$(git log -1 --pretty=%s)"
+          NOTES="$(printf '%s\n\nCommit: %s\nBranch: %s\nTests: %s\n\n%s\n' \
+            "$SUBJECT" "${GITHUB_SHA}" "${GITHUB_REF_NAME}" "${{ steps.tests.outputs.summary }}" "${{ steps.apk.outputs.signing }}")"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${{ steps.apk.outputs.dir }}"/*.apk --clobber
+          else
+            gh release create "$TAG" "${{ steps.apk.outputs.dir }}"/*.apk \
+              --target "$GITHUB_SHA" --title "SecFiles ${{ steps.apk.outputs.version }}" --notes "$NOTES" $FLAGS
+          fi

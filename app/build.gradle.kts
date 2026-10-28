@@ -12,8 +12,10 @@ android {
         applicationId = "app.secfiles.android"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        // CI numbers builds so every release can install over the previous one; local builds are "0.2.0 / 1".
+        val build = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
+        versionCode = build ?: 1
+        versionName = if (build != null) "0.2.$build" else "0.2.0"
     }
 
     buildTypes {
