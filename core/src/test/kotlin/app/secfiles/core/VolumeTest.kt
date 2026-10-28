@@ -76,7 +76,7 @@ class VolumeTest {
     fun tamperedHeaderFailsAuthentication() {
         val raw = newRaw()
         Volume.create(raw, dataSize, cred("pw"), fast).close()
-        for (pos in listOf(30L, 100L, 640L)) { // salt, body, mac
+        for (pos in listOf(12L, 30L, 100L, 1200L, 2300L)) { // kdf params, salt, falcon key, signature, body
             val t = MemoryRandomAccess(raw.size)
             val all = ByteArray(raw.size.toInt()).also { raw.read(0, it, 0, it.size) }
             t.write(0, all, 0, all.size)
@@ -85,7 +85,7 @@ class VolumeTest {
                 val one = ByteArray(1).also { t.read(base + pos, it, 0, 1) }
                 t.write(base + pos, byteArrayOf((one[0] + 1).toByte()), 0, 1)
             }
-            assertFailsWith<WrongPasswordException>("pos=$pos") { Volume.open(t, cred("pw")) }
+            assertFailsWith<HeaderTamperedException>("pos=$pos") { Volume.open(t, cred("pw")) }
         }
     }
 
@@ -134,6 +134,59 @@ class VolumeTest {
         val v2 = Volume.open(raw, cred("new"))
         val got = ByteArray(4096).also { v2.read(7, it) }
         assertContentEquals(block, got)
+    }
+
+    @Test
+    fun everyDepthCreatesOpensAndPersistsItsStructure() {
+        for (layers in 1..5) {
+            val raw = newRaw()
+            val v = Volume.create(raw, dataSize, cred("pw"), fast, layers = layers, compress = layers % 2 == 0)
+            val block = ByteArray(4096) { (it * layers).toByte() }
+            v.write(9, block)
+            val kinds = v.structure.ciphers
+            val comp = v.structure.compression
+            assertEquals(layers, v.layers)
+            assertEquals(layers % 2 == 0, comp != null)
+            v.close()
+            val v2 = Volume.open(raw, cred("pw"))
+            assertEquals(kinds, v2.structure.ciphers, "cipher order is restored from the header")
+            assertEquals(comp, v2.structure.compression)
+            assertContentEquals(block, ByteArray(4096).also { v2.read(9, it) })
+        }
+    }
+
+    @Test
+    fun structureVariesBetweenContainersButNotWithPasswordChange() {
+        val seen = mutableSetOf<List<CipherKind>>()
+        repeat(6) { seen += Volume.create(newRaw(), dataSize, cred("same password"), fast, layers = 5).structure.ciphers }
+        assertTrue(seen.size > 1, "per-container salt should vary the cipher order")
+
+        val raw = newRaw()
+        val v = Volume.create(raw, dataSize, cred("old"), fast, layers = 4, compress = true)
+        val before = v.structure.ciphers to v.structure.compression
+        val block = ByteArray(4096) { 0x33 }
+        v.write(2, block)
+        v.changeCredentials(cred("new"), fast)
+        v.close()
+        val v2 = Volume.open(raw, cred("new"))
+        assertEquals(before, v2.structure.ciphers to v2.structure.compression)
+        assertContentEquals(block, ByteArray(4096).also { v2.read(2, it) })
+    }
+
+    @Test
+    fun damagedPrimaryUsesBackupButBothDamagedIsReportedAsTampering() {
+        val raw = newRaw()
+        Volume.create(raw, dataSize, cred("pw"), fast, layers = 2).close()
+        raw.write(1500, byteArrayOf(1, 2, 3), 0, 3) // inside the Falcon public key of the primary
+        Volume.open(raw, cred("pw")).close()
+        raw.write(raw.size - 4096 + 1500, byteArrayOf(1, 2, 3), 0, 3)
+        assertFailsWith<HeaderTamperedException> { Volume.open(raw, cred("pw")) }
+    }
+
+    @Test
+    fun layersOutOfRangeAreRejected() {
+        assertFailsWith<IllegalArgumentException> { Volume.create(newRaw(), dataSize, cred("pw"), fast, layers = 0) }
+        assertFailsWith<IllegalArgumentException> { Volume.create(newRaw(), dataSize, cred("pw"), fast, layers = 6) }
     }
 
     @Test

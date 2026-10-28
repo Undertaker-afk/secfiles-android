@@ -1,6 +1,11 @@
 package app.secfiles.core
 
 import org.bouncycastle.crypto.BlockCipher
+import org.bouncycastle.crypto.engines.ARIAEngine
+import org.bouncycastle.crypto.engines.CAST6Engine
+import org.bouncycastle.crypto.engines.CamelliaEngine
+import org.bouncycastle.crypto.engines.GOST3412_2015Engine
+import org.bouncycastle.crypto.engines.RC6Engine
 import org.bouncycastle.crypto.engines.SerpentEngine
 import org.bouncycastle.crypto.engines.TwofishEngine
 import org.bouncycastle.crypto.params.KeyParameter
@@ -17,9 +22,12 @@ internal fun interface EcbFactory {
     fun create(key: ByteArray, encrypt: Boolean): EcbBulk
 }
 
-/** The three ciphers in the cascade. All use 256-bit keys and 128-bit blocks. */
-enum class CipherKind(val displayName: String, internal val factory: EcbFactory) {
-    AES("AES-256", EcbFactory { key, enc ->
+/**
+ * The pool of block ciphers a cascade is drawn from. All use 256-bit keys and 128-bit blocks, which is
+ * what XTS needs. [id] values are stored in container headers and must never change.
+ */
+enum class CipherKind(val id: Int, val displayName: String, internal val factory: EcbFactory) {
+    AES(0, "AES-256", EcbFactory { key, enc ->
         val c = Cipher.getInstance("AES/ECB/NoPadding")
         c.init(if (enc) Cipher.ENCRYPT_MODE else Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"))
         object : EcbBulk {
@@ -30,11 +38,17 @@ enum class CipherKind(val displayName: String, internal val factory: EcbFactory)
             }
         }
     }),
-    TWOFISH("Twofish-256", EcbFactory { key, enc -> bcEcb(TwofishEngine(), key, enc) }),
-    SERPENT("Serpent-256", EcbFactory { key, enc -> bcEcb(SerpentEngine(), key, enc) });
+    TWOFISH(1, "Twofish-256", EcbFactory { key, enc -> bcEcb(TwofishEngine(), key, enc) }),
+    SERPENT(2, "Serpent-256", EcbFactory { key, enc -> bcEcb(SerpentEngine(), key, enc) }),
+    CAMELLIA(3, "Camellia-256", EcbFactory { key, enc -> bcEcb(CamelliaEngine(), key, enc) }),
+    KUZNYECHIK(4, "Kuznyechik", EcbFactory { key, enc -> bcEcb(GOST3412_2015Engine(), key, enc) }),
+    ARIA(5, "ARIA-256", EcbFactory { key, enc -> bcEcb(ARIAEngine(), key, enc) }),
+    CAST6(6, "CAST-256", EcbFactory { key, enc -> bcEcb(CAST6Engine(), key, enc) }),
+    RC6(7, "RC6-256", EcbFactory { key, enc -> bcEcb(RC6Engine(), key, enc) });
 
     companion object {
         const val KEY_BYTES = 32
+        fun byId(id: Int) = values().firstOrNull { it.id == id }
     }
 }
 

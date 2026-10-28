@@ -16,6 +16,10 @@ kotlin {
 dependencies {
     // Serpent, Twofish, Argon2id. AES comes from the JCE so Android uses its accelerated provider.
     api("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    // Compression engines (all pure Java so they run unchanged on Android).
+    implementation("org.tukaani:xz:1.10")
+    implementation("org.itadaki:bzip2:0.9.1")
+    implementation("org.iq80.snappy:snappy:0.4")
     testImplementation(kotlin("test"))
 }
 

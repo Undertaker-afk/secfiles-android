@@ -1,48 +1,62 @@
 package app.secfiles.core
 
+import org.bouncycastle.crypto.modes.ChaCha20Poly1305
+import org.bouncycastle.crypto.params.KeyParameter
+import org.bouncycastle.crypto.params.ParametersWithIV
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.security.SecureRandom
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 
 class WrongPasswordException : IOException("Wrong password/keyfiles, or not a SecFiles container")
 class CorruptVolumeException(msg: String) : IOException(msg)
 class CancelledException : IOException("Cancelled")
+class HeaderTamperedException :
+    IOException("The container header failed its integrity check. It is damaged or has been tampered with.")
 
 /**
  * An encrypted container.
  *
  *     [ header 4096 ][ data area: N x 4096-byte XTS data units ][ backup header 4096 ]
  *
- * Header (cleartext fields are authenticated, never trusted before the MAC passes):
+ * Header v2:
  *
- *     0   magic "SFCVOL01"
- *     8   argon2 memory KiB (u32) | 12 iterations (u32) | 16 parallelism (u32) | 20 reserved (u32)
- *     24  salt (64)
- *     88  body (512) : encrypted with the AES>Twofish>Serpent cascade keyed from Argon2id output [0,192)
- *     600 HMAC-SHA-512 over bytes [0,600) keyed with Argon2id output [192,256)
- *     664 CRC-32 of bytes [0,664) (lets us tell "wrong password" from "damaged header" without a second KDF run)
- *     668 random padding to 4096
+ *     0     magic "SFCVOL02"
+ *     8     argon2 memory KiB | iterations | parallelism | reserved   (4 x u32)
+ *     24    salt (64)
+ *     88    Falcon-512 public key   (u16 length + bytes, 1024-byte slot)
+ *     1112  Falcon-512 signature   (u16 length + bytes, 1024-byte slot)
+ *     2136  body (512)
+ *     2648  random padding to 4096
  *
- * Body plaintext: "SFCBODY1" | version u32 | sector size u32 | data size u64 | created ms u64 |
- * master keys (192) | random padding.
+ * Opening checks, in this order: (1) the Falcon signature over [0,1112) + body, which needs no password
+ * and so runs before the slow KDF and tells "damaged/tampered" apart from "wrong password"; (2) the
+ * ChaCha20-Poly1305 tag of the sealed body, keyed from Argon2id(password, keyfiles, salt).
  *
- * The master keys are random and independent of the password, so changing the password only rewrites
- * the two headers rather than re-encrypting the data area.
+ * Body = XTS cascade of the five header ciphers over ChaCha20-Poly1305(plaintext), plaintext (496 bytes):
+ * magic "SFCBODY2" | version | sector size | data size | created ms | layers | compression id |
+ * falcon seed (32) | cipher ids (5) | master keys (layers x 64) | random.
+ *
+ * The master keys are random and independent of the password, so changing the password only rewrites the
+ * two headers instead of re-encrypting the data area.
  */
 class Volume private constructor(
     private val raw: RandomAccess,
     val dataSize: Long,
-    private var masterKeys: ByteArray,
+    private val masterKeys: ByteArray,
+    val structure: Structure,
+    private val falconSeed: ByteArray,
     private val kdf: KdfParams,
 ) : BlockDevice {
-    private var cascade = Cascade(masterKeys)
+    private val cascade = Cascade(structure.ciphers, masterKeys)
     override val blockSize get() = SECTOR_SIZE
     override val blockCount get() = dataSize / SECTOR_SIZE
+
     @Volatile
     private var closed = false
+
+    /** Number of cipher layers (the only part of the structure the user chooses). */
+    val layers get() = structure.ciphers.size
 
     private fun check() {
         if (closed) throw IOException("Volume is locked")
@@ -72,11 +86,11 @@ class Volume private constructor(
         raw.flush()
     }
 
-    /** Re-keys the headers (primary and backup) with new credentials. Data is untouched. */
+    /** Re-keys the headers (primary and backup) with new credentials. Data and structure are untouched. */
     fun changeCredentials(newCredentials: Credentials, newKdf: KdfParams = kdf) {
         check()
-        val header = buildHeader(masterKeys, dataSize, newCredentials, newKdf)
-        writeHeaders(raw, header, totalFileSize(dataSize))
+        val sealed = seal(newCredentials, newKdf, dataSize, masterKeys, structure, falconSeed)
+        writeHeaders(raw, sealed.header, totalFileSize(dataSize))
         raw.flush()
     }
 
@@ -84,6 +98,7 @@ class Volume private constructor(
         if (closed) return
         closed = true
         masterKeys.fill(0)
+        falconSeed.fill(0)
         runCatching { raw.close() }
     }
 
@@ -94,34 +109,44 @@ class Volume private constructor(
         const val HEADER_SIZE = 4096L
         const val MIN_DATA_SIZE = 1L * 1024 * 1024
 
-        private val MAGIC = "SFCVOL01".toByteArray()
-        private val BODY_MAGIC = "SFCBODY1".toByteArray()
+        private val MAGIC = "SFCVOL02".toByteArray()
+        private val BODY_MAGIC = "SFCBODY2".toByteArray()
         private const val OFF_SALT = 24
-        private const val OFF_BODY = 88
+        private const val OFF_PK = 88
+        private const val OFF_SIG = 1112
+        private const val SLOT = 1024
+        private const val OFF_BODY = 2136
         private const val BODY_LEN = 512
-        private const val OFF_MAC = OFF_BODY + BODY_LEN
-        private const val MAC_LEN = 64
-        private const val OFF_CRC = OFF_MAC + MAC_LEN
-        private val DERIVED_LEN = Cascade.KEY_MATERIAL_BYTES + 64
+        private const val PLAIN_LEN = BODY_LEN - 16 // ChaCha20-Poly1305 adds a 16-byte tag
+        private const val SIGNED_PREFIX = OFF_SIG
+
+        private val HEADER_KEYS = Cascade.keyBytes(Cascade.HEADER_KINDS.size) // 320
+        private val DERIVED_LEN = HEADER_KEYS + 32 /* chacha key */ + 32 /* structure seed */
 
         fun totalFileSize(dataSize: Long) = HEADER_SIZE + dataSize + HEADER_SIZE
 
         /**
          * Writes a brand-new container into [raw] and returns it opened. The data area is filled with
          * random bytes (so free space is indistinguishable from encrypted data) and the headers are
-         * written last. [progress] receives 0..1 and may throw [CancelledException].
+         * written last. [layers] (1..5) is the cascade depth; which ciphers, in which order, and which
+         * compression engine (if [compress]) are drawn from a hash of the derived key material.
+         * [progress] receives 0..1 and may throw [CancelledException].
          */
         fun create(
             raw: RandomAccess,
             dataSize: Long,
             credentials: Credentials,
             kdf: KdfParams = KdfParams.MAXIMUM,
+            layers: Int = 3,
+            compress: Boolean = false,
             progress: (Double) -> Unit = {},
         ): Volume {
             require(dataSize >= MIN_DATA_SIZE && dataSize % SECTOR_SIZE == 0L) { "bad data size" }
+            require(layers in 1..Cascade.MAX_LAYERS) { "layers must be 1..${Cascade.MAX_LAYERS}" }
             val rnd = SecureRandom()
-            val keys = ByteArray(Cascade.KEY_MATERIAL_BYTES).also { rnd.nextBytes(it) }
-            val header = buildHeader(keys, dataSize, credentials, kdf)
+            val keys = ByteArray(Cascade.keyBytes(layers)).also { rnd.nextBytes(it) }
+            val seed = ByteArray(32).also { rnd.nextBytes(it) }
+            val sealed = seal(credentials, kdf, dataSize, keys, null, seed, layers, compress)
 
             val chunk = ByteArray(1 shl 20)
             var pos = HEADER_SIZE
@@ -133,110 +158,160 @@ class Volume private constructor(
                 pos += n
                 progress((pos - HEADER_SIZE).toDouble() / dataSize)
             }
-            writeHeaders(raw, header, totalFileSize(dataSize))
+            writeHeaders(raw, sealed.header, totalFileSize(dataSize))
             raw.flush()
-            return Volume(raw, dataSize, keys, kdf)
+            return Volume(raw, dataSize, keys, sealed.structure, seed, kdf)
         }
 
-        /** Opens an existing container; tries the primary header and then the backup. */
+        /** Opens an existing container; falls back to the backup header only if the primary is damaged. */
         fun open(raw: RandomAccess, credentials: Credentials): Volume {
             val size = raw.size
             if (size < HEADER_SIZE * 2 + MIN_DATA_SIZE) throw WrongPasswordException()
             val primary = ByteArray(HEADER_SIZE.toInt()).also { raw.read(0, it, 0, it.size) }
             val backup = ByteArray(HEADER_SIZE.toInt()).also { raw.read(size - HEADER_SIZE, it, 0, it.size) }
+            var sawSfc = false
             for (h in listOf(primary, backup)) {
-                val parsed = parseHeader(h, credentials)
-                if (parsed == null) {
-                    // An intact header that fails authentication means a wrong password; only a damaged
-                    // one is worth a second (expensive) attempt with the backup copy.
-                    if (crcOk(h)) throw WrongPasswordException()
-                    continue
-                }
-                val expected = HEADER_SIZE + parsed.dataSize + HEADER_SIZE
-                if (parsed.dataSize % SECTOR_SIZE != 0L || expected > size) {
-                    parsed.keys.fill(0)
+                if (!MessageDigest.isEqual(h.copyOfRange(0, 8), MAGIC)) continue
+                sawSfc = true
+                if (!signatureOk(h)) continue // damaged or tampered: try the other copy
+                // Signature is good, so any failure from here on is the password, not damage.
+                val p = unseal(h, credentials) ?: throw WrongPasswordException()
+                val expected = HEADER_SIZE + p.dataSize + HEADER_SIZE
+                if (p.dataSize % SECTOR_SIZE != 0L || expected > size) {
+                    p.keys.fill(0); p.seed.fill(0)
                     throw CorruptVolumeException("Container file is truncated")
                 }
-                return Volume(raw, parsed.dataSize, parsed.keys, parsed.kdf)
+                return Volume(raw, p.dataSize, p.keys, p.structure, p.seed, p.kdf)
             }
+            if (sawSfc) throw HeaderTamperedException()
             throw WrongPasswordException()
         }
 
-        private class Parsed(val dataSize: Long, val keys: ByteArray, val kdf: KdfParams)
+        private class Parsed(val dataSize: Long, val keys: ByteArray, val structure: Structure, val seed: ByteArray, val kdf: KdfParams)
+        private class Sealed(val header: ByteArray, val structure: Structure)
 
-        private fun buildHeader(keys: ByteArray, dataSize: Long, cred: Credentials, kdf: KdfParams): ByteArray {
+        private fun signedMessage(h: ByteArray): ByteArray =
+            h.copyOfRange(0, SIGNED_PREFIX) + h.copyOfRange(OFF_BODY, OFF_BODY + BODY_LEN)
+
+        private fun slot(h: ByteArray, off: Int): ByteArray? {
+            val len = ((h[off].toInt() and 0xFF) shl 8) or (h[off + 1].toInt() and 0xFF)
+            if (len == 0 || len > SLOT - 2) return null
+            return h.copyOfRange(off + 2, off + 2 + len)
+        }
+
+        private fun putSlot(h: ByteArray, off: Int, data: ByteArray) {
+            require(data.size <= SLOT - 2)
+            h[off] = (data.size ushr 8).toByte(); h[off + 1] = data.size.toByte()
+            System.arraycopy(data, 0, h, off + 2, data.size)
+        }
+
+        private fun signatureOk(h: ByteArray): Boolean {
+            val pk = slot(h, OFF_PK) ?: return false
+            val sig = slot(h, OFF_SIG) ?: return false
+            return Integrity.verify(pk, signedMessage(h), sig)
+        }
+
+        private fun chacha(encrypt: Boolean, key: ByteArray, nonce: ByteArray, aad: ByteArray, input: ByteArray): ByteArray? {
+            val c = ChaCha20Poly1305()
+            c.init(encrypt, ParametersWithIV(KeyParameter(key), nonce))
+            c.processAADBytes(aad, 0, aad.size)
+            val out = ByteArray(c.getOutputSize(input.size))
+            var n = c.processBytes(input, 0, input.size, out, 0)
+            return try {
+                n += c.doFinal(out, n)
+                out.copyOf(n)
+            } catch (e: org.bouncycastle.crypto.InvalidCipherTextException) {
+                null
+            }
+        }
+
+        /** Builds a signed header. [structure] null = derive a fresh one from the KDF output (creation). */
+        private fun seal(
+            cred: Credentials, kdf: KdfParams, dataSize: Long, keys: ByteArray, structure: Structure?, falconSeed: ByteArray,
+            layers: Int = keys.size / 64, compress: Boolean = false,
+        ): Sealed {
             val rnd = SecureRandom()
-            val h = ByteArray(HEADER_SIZE.toInt())
-            rnd.nextBytes(h)
+            val h = ByteArray(HEADER_SIZE.toInt()).also { rnd.nextBytes(it) }
             val bb = ByteBuffer.wrap(h)
             bb.put(MAGIC)
             bb.putInt(kdf.memoryKiB).putInt(kdf.iterations).putInt(kdf.parallelism).putInt(0)
             val salt = ByteArray(64).also { rnd.nextBytes(it) }
             System.arraycopy(salt, 0, h, OFF_SALT, 64)
-
-            val body = ByteArray(BODY_LEN).also { rnd.nextBytes(it) }
-            val bodyBuf = ByteBuffer.wrap(body)
-            bodyBuf.put(BODY_MAGIC).putInt(1).putInt(SECTOR_SIZE).putLong(dataSize).putLong(System.currentTimeMillis())
-            bodyBuf.put(keys)
+            val fk = Integrity.keysFromSeed(falconSeed)
+            putSlot(h, OFF_PK, fk.publicKey)
 
             val derived = Kdf.derive(cred, salt, kdf, DERIVED_LEN)
+            val plain = ByteArray(PLAIN_LEN).also { rnd.nextBytes(it) }
             try {
-                Cascade(derived.copyOfRange(0, Cascade.KEY_MATERIAL_BYTES)).encrypt(0, body, 0, BODY_LEN)
-                System.arraycopy(body, 0, h, OFF_BODY, BODY_LEN)
-                val mac = hmac(derived.copyOfRange(Cascade.KEY_MATERIAL_BYTES, DERIVED_LEN), h, 0, OFF_MAC)
-                System.arraycopy(mac, 0, h, OFF_MAC, MAC_LEN)
-                ByteBuffer.wrap(h).putInt(OFF_CRC, crc(h))
+                val st = structure ?: Structure.derive(derived.copyOfRange(HEADER_KEYS + 32, DERIVED_LEN), layers, compress)
+                val b = ByteBuffer.wrap(plain)
+                b.put(BODY_MAGIC).putInt(2).putInt(SECTOR_SIZE).putLong(dataSize).putLong(System.currentTimeMillis())
+                b.putInt(st.ciphers.size).putInt(st.compression?.id ?: NO_COMPRESSION)
+                b.put(falconSeed)
+                for (i in 0 until Cascade.MAX_LAYERS) b.put((st.ciphers.getOrNull(i)?.id ?: 0xFF).toByte())
+                b.position(80)
+                b.put(keys)
+
+                val sealedBody = chacha(true, derived.copyOfRange(HEADER_KEYS, HEADER_KEYS + 32), salt.copyOfRange(0, 12),
+                    h.copyOfRange(0, SIGNED_PREFIX), plain)!!
+                check(sealedBody.size == BODY_LEN)
+                Cascade(Cascade.HEADER_KINDS, derived.copyOfRange(0, HEADER_KEYS)).encrypt(0, sealedBody, 0, BODY_LEN)
+                System.arraycopy(sealedBody, 0, h, OFF_BODY, BODY_LEN)
+
+                putSlot(h, OFF_SIG, Integrity.sign(fk, signedMessage(h)))
+                return Sealed(h, st)
             } finally {
                 derived.fill(0)
-                body.fill(0)
+                plain.fill(0)
             }
-            return h
         }
 
-        private fun parseHeader(h: ByteArray, cred: Credentials): Parsed? {
-            if (!MessageDigest.isEqual(h.copyOfRange(0, 8), MAGIC)) return null
+        private fun unseal(h: ByteArray, cred: Credentials): Parsed? {
             val bb = ByteBuffer.wrap(h, 8, 16)
             val kdf = KdfParams(memoryKiB = bb.int, iterations = bb.int, parallelism = bb.int)
-            if (!KdfParams.isSane(kdf)) return null
+            if (!KdfParams.isSane(kdf)) throw HeaderTamperedException()
             val salt = h.copyOfRange(OFF_SALT, OFF_SALT + 64)
             val derived = Kdf.derive(cred, salt, kdf, DERIVED_LEN)
             try {
-                val mac = hmac(derived.copyOfRange(Cascade.KEY_MATERIAL_BYTES, DERIVED_LEN), h, 0, OFF_MAC)
-                if (!MessageDigest.isEqual(mac, h.copyOfRange(OFF_MAC, OFF_MAC + MAC_LEN))) return null
                 val body = h.copyOfRange(OFF_BODY, OFF_BODY + BODY_LEN)
-                Cascade(derived.copyOfRange(0, Cascade.KEY_MATERIAL_BYTES)).decrypt(0, body, 0, BODY_LEN)
-                if (!MessageDigest.isEqual(body.copyOfRange(0, 8), BODY_MAGIC)) return null
-                val b = ByteBuffer.wrap(body, 8, BODY_LEN - 8)
-                val version = b.int
-                val sector = b.int
-                val dataSize = b.long
-                b.long // created
-                if (version != 1 || sector != SECTOR_SIZE || dataSize < MIN_DATA_SIZE) {
-                    throw CorruptVolumeException("Unsupported container version")
-                }
-                val keys = ByteArray(Cascade.KEY_MATERIAL_BYTES).also { b.get(it) }
+                Cascade(Cascade.HEADER_KINDS, derived.copyOfRange(0, HEADER_KEYS)).decrypt(0, body, 0, BODY_LEN)
+                val plain = chacha(false, derived.copyOfRange(HEADER_KEYS, HEADER_KEYS + 32), salt.copyOfRange(0, 12),
+                    h.copyOfRange(0, SIGNED_PREFIX), body) ?: return null
                 body.fill(0)
-                return Parsed(dataSize, keys, kdf)
+                try {
+                    if (!MessageDigest.isEqual(plain.copyOfRange(0, 8), BODY_MAGIC)) return null
+                    val b = ByteBuffer.wrap(plain, 8, plain.size - 8)
+                    val version = b.int
+                    val sector = b.int
+                    val dataSize = b.long
+                    b.long // created
+                    val depth = b.int
+                    val compId = b.int
+                    if (version != 2 || sector != SECTOR_SIZE || dataSize < MIN_DATA_SIZE || depth !in 1..Cascade.MAX_LAYERS) {
+                        throw CorruptVolumeException("Unsupported container version")
+                    }
+                    val seed = ByteArray(32).also { b.get(it) }
+                    val kinds = (0 until Cascade.MAX_LAYERS).map { b.get().toInt() and 0xFF }.take(depth).map {
+                        CipherKind.byId(it) ?: throw CorruptVolumeException("Unknown cipher in header")
+                    }
+                    val compression = if (compId == NO_COMPRESSION) null
+                    else Compression.byId(compId) ?: throw CorruptVolumeException("Unknown compression in header")
+                    b.position(80)
+                    val keys = ByteArray(Cascade.keyBytes(depth)).also { b.get(it) }
+                    return Parsed(dataSize, keys, Structure(kinds, compression), seed, kdf)
+                } finally {
+                    plain.fill(0)
+                }
             } finally {
                 derived.fill(0)
             }
         }
+
+        private const val NO_COMPRESSION = 255
 
         private fun writeHeaders(raw: RandomAccess, header: ByteArray, totalSize: Long) {
             raw.write(0, header, 0, header.size)
             raw.write(totalSize - HEADER_SIZE, header, 0, header.size)
-        }
-
-        private fun crc(h: ByteArray): Int =
-            java.util.zip.CRC32().also { it.update(h, 0, OFF_CRC) }.value.toInt()
-
-        private fun crcOk(h: ByteArray) = ByteBuffer.wrap(h).getInt(OFF_CRC) == crc(h)
-
-        private fun hmac(key: ByteArray, data: ByteArray, off: Int, len: Int): ByteArray {
-            val m = Mac.getInstance("HmacSHA512")
-            m.init(SecretKeySpec(key, "HmacSHA512"))
-            m.update(data, off, len)
-            return m.doFinal()
         }
     }
 }

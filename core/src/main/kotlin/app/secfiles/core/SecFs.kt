@@ -45,7 +45,12 @@ class SecFs private constructor(private val dev: BlockDevice) {
     private var allocHint = 0L
     private var justAllocated = false
 
-    private class Inode(var mode: Int = 0, var size: Long = 0, var mtime: Long = 0, var parent: Int = 0) {
+    /** Compression engine for newly created files, or null if the volume is uncompressed. */
+    var compression: Compression? = null
+        private set
+    private var codec: Codec? = null
+
+    private class Inode(var mode: Int = 0, var size: Long = 0, var mtime: Long = 0, var parent: Int = 0, var flags: Int = 0) {
         val ptr = IntArray(PTR_SLOTS)
     }
 
@@ -88,6 +93,7 @@ class SecFs private constructor(private val dev: BlockDevice) {
     fun read(id: Int, pos: Long, dst: ByteArray, off: Int, len: Int): Int {
         val ino = readInode(id)
         if (ino.mode != MODE_FILE) throw FsException("Not a file")
+        if (ino.flags and F_COMPRESSED != 0) return readCompressed(id, ino, pos, dst, off, len)
         if (pos >= ino.size || len == 0) return 0
         val total = minOf(len.toLong(), ino.size - pos).toInt()
         val tmp = ByteArray(bs)
@@ -115,6 +121,10 @@ class SecFs private constructor(private val dev: BlockDevice) {
         if (ino.mode != MODE_FILE) throw FsException("Not a file")
         if (len == 0) return
         if (pos + len > MAX_FILE_BLOCKS * bs) throw FsException("File too large")
+        if (ino.flags and F_COMPRESSED != 0) {
+            writeCompressed(id, pos, src, off, len)
+            return
+        }
         val tmp = ByteArray(bs)
         var done = 0
         try {
@@ -148,6 +158,10 @@ class SecFs private constructor(private val dev: BlockDevice) {
         val ino = readInode(id)
         if (ino.mode != MODE_FILE) throw FsException("Not a file")
         if (newSize > MAX_FILE_BLOCKS * bs) throw FsException("File too large")
+        if (ino.flags and F_COMPRESSED != 0) {
+            truncateCompressed(id, newSize)
+            return
+        }
         if (newSize < ino.size) shrink(ino, newSize)
         ino.size = newSize
         ino.mtime = System.currentTimeMillis()
@@ -199,8 +213,16 @@ class SecFs private constructor(private val dev: BlockDevice) {
 
     @Synchronized
     fun flush() {
+        commit()
         flushBitmap()
         dev.flush()
+    }
+
+    /** Zeroes plaintext held in memory. Call after [flush] when locking. */
+    @Synchronized
+    fun wipe() {
+        cc.buf.fill(0); rc.buf.fill(0)
+        cc.idx = -1; rc.idx = -1; cc.dirty = false
     }
 
     // ---- directories ------------------------------------------------------------------------
@@ -257,7 +279,7 @@ class SecFs private constructor(private val dev: BlockDevice) {
         val entries = readDir(dirId).toMutableList()
         if (entries.any { it.first == name }) throw AlreadyExistsException(name)
         val id = allocInode()
-        val ino = Inode(mode, 0, System.currentTimeMillis(), dirId)
+        val ino = Inode(mode, 0, System.currentTimeMillis(), dirId, if (mode == MODE_FILE && compression != null) F_COMPRESSED else 0)
         writeInode(id, ino)
         entries.add(name to id)
         try {
@@ -270,6 +292,8 @@ class SecFs private constructor(private val dev: BlockDevice) {
     }
 
     private fun destroy(id: Int) {
+        if (cc.id == id) { cc.idx = -1; cc.dirty = false }
+        if (rc.id == id) rc.idx = -1
         val ino = readInode(id)
         if (ino.mode == MODE_DIR) {
             for ((_, child) in readDir(id)) destroy(child)
@@ -428,6 +452,244 @@ class SecFs private constructor(private val dev: BlockDevice) {
         return false
     }
 
+    // ---- compressed files ---------------------------------------------------------------------
+    //
+    // A compressed file is cut into 64 KiB logical chunks; chunk c owns the 16 block slots
+    // [16c, 16c+16) of the normal pointer tree. How a chunk is stored is inferred from how many slots are
+    // populated, with L = the chunk's logical length (min(64 KiB, size - c*64 KiB)):
+    //   0 slots                         hole, reads as zeros
+    //   ceil(L/4096) slots              raw bytes
+    //   fewer slots                     [u32 length][compressed bytes]
+    // A chunk is only stored compressed when that saves at least one block, so the rule is unambiguous.
+    // Because L comes from the file size, the size and the chunk holding the end of file are always
+    // committed together.
+
+    private class Chunk {
+        var id = 0
+        var idx = -1L
+        var len = 0
+        var dirty = false
+        var pendingSize = 0L
+        val buf = ByteArray(CHUNK)
+    }
+
+    private val cc = Chunk() // single write-back chunk; idx >= 0 only while dirty
+    private val rc = Chunk() // clean read cache
+    private val slots get() = CHUNK / bs
+
+    private fun chunkLen(size: Long, c: Long): Int = minOf(CHUNK.toLong(), size - c * CHUNK).coerceAtLeast(0).toInt()
+
+    private fun codecOrFail() = codec ?: throw FsException("This volume has no compression engine")
+
+    private fun allZero(b: ByteArray, len: Int): Boolean {
+        for (i in 0 until len) if (b[i].toInt() != 0) return false
+        return true
+    }
+
+    /** Decodes chunk [c] (whose on-disk logical length is [lc]) into out[0, CHUNK), zero-padded. */
+    private fun decodeChunk(ino: Inode, c: Long, lc: Int, out: ByteArray) {
+        java.util.Arrays.fill(out, 0, CHUNK, 0)
+        if (lc == 0) return
+        val first = c * slots
+        var k = 0
+        while (k < slots && mapBlock(ino, first + k, false) != 0L) k++
+        if (k == 0) return
+        val need = (lc + bs - 1) / bs
+        val tmp = ByteArray(k * bs)
+        for (i in 0 until k) dev.read(mapBlock(ino, first + i, false), tmp, i * bs)
+        try {
+            when {
+                k == need -> System.arraycopy(tmp, 0, out, 0, lc)
+                k < need -> {
+                    val clen = ByteBuffer.wrap(tmp).int
+                    if (clen <= 0 || clen > k * bs - 4) throw CorruptVolumeException("Corrupt compressed chunk")
+                    codecOrFail().decompress(tmp, 4, clen, out, lc)
+                }
+                else -> throw CorruptVolumeException("Corrupt compressed chunk")
+            }
+        } finally {
+            tmp.fill(0)
+        }
+    }
+
+    /** Writes chunk [c] (logical length [l]) and sets the file size to [newSize] in the same inode update. */
+    private fun storeChunk(id: Int, c: Long, data: ByteArray, l: Int, newSize: Long) {
+        val ino = readInode(id)
+        val first = c * slots
+        var comp: ByteArray? = null
+        var kNew = 0
+        if (l > 0 && !allZero(data, l)) {
+            val need = (l + bs - 1) / bs
+            val z = codecOrFail().compress(data, 0, l)
+            val kc = (4 + z.size + bs - 1) / bs
+            if (kc < need) { comp = z; kNew = kc } else kNew = need
+        }
+        var have = 0
+        while (have < slots && mapBlock(ino, first + have, false) != 0L) have++
+        // Check space up front so a full volume never leaves a half-overwritten chunk behind.
+        if (kNew > have && freeBlockCount < (kNew - have) + 3) throw VolumeFullException()
+        val stream: ByteArray? = comp?.let {
+            ByteArray(kNew * bs).also { s -> ByteBuffer.wrap(s).putInt(it.size); System.arraycopy(it, 0, s, 4, it.size) }
+        }
+        val blk = ByteArray(bs)
+        for (i in 0 until kNew) {
+            java.util.Arrays.fill(blk, 0)
+            if (stream != null) System.arraycopy(stream, i * bs, blk, 0, bs)
+            else System.arraycopy(data, i * bs, blk, 0, minOf(bs, l - i * bs))
+            dev.write(mapBlock(ino, first + i, true), blk, 0)
+        }
+        blk.fill(0)
+        for (i in kNew until have) clearSlot(ino, first + i)
+        ino.size = newSize
+        ino.mtime = System.currentTimeMillis()
+        flushBitmap()
+        writeInode(id, ino)
+        if (rc.id == id && rc.idx == c) rc.idx = -1
+    }
+
+    private fun clearSlot(ino: Inode, idx: Long) {
+        if (idx < DIRECT) {
+            freeBlock(ino.ptr[idx.toInt()].toLong() and 0xFFFFFFFFL); ino.ptr[idx.toInt()] = 0
+            return
+        }
+        var i = idx - DIRECT
+        if (i < ptrsPerBlock) {
+            freeEntry(ino.ptr[IND_SLOT].toLong() and 0xFFFFFFFFL, i.toInt())
+            return
+        }
+        i -= ptrsPerBlock
+        val l1 = ByteBuffer.wrap(ByteArray(bs).also { dev.read(ino.ptr[DIND_SLOT].toLong() and 0xFFFFFFFFL, it, 0) })
+            .getInt((i / ptrsPerBlock).toInt() * 4).toLong() and 0xFFFFFFFFL
+        freeEntry(l1, (i % ptrsPerBlock).toInt())
+    }
+
+    private fun freeEntry(blk: Long, i: Int) {
+        val buf = ByteArray(bs)
+        dev.read(blk, buf, 0)
+        val bb = ByteBuffer.wrap(buf)
+        val e = bb.getInt(i * 4)
+        if (e != 0) {
+            freeBlock(e.toLong() and 0xFFFFFFFFL)
+            bb.putInt(i * 4, 0)
+            dev.write(blk, buf, 0)
+        }
+    }
+
+    /** Flushes the write-back chunk, if any. */
+    private fun commit() {
+        if (!cc.dirty) { cc.idx = -1; return }
+        val id = cc.id
+        val c = cc.idx
+        cc.dirty = false
+        cc.idx = -1
+        storeChunk(id, c, cc.buf, cc.len, cc.pendingSize)
+    }
+
+    /** Re-stores chunk [c] with a new logical length, zero-extending or cutting; size becomes c*64K + lNew. */
+    private fun rewriteChunk(id: Int, c: Long, lOld: Int, lNew: Int) {
+        val ino = readInode(id)
+        val tmp = ByteArray(CHUNK)
+        try {
+            decodeChunk(ino, c, lOld, tmp)
+            storeChunk(id, c, tmp, lNew, c * CHUNK + lNew)
+        } finally {
+            tmp.fill(0)
+        }
+    }
+
+    private fun readCompressed(id: Int, ino: Inode, pos: Long, dst: ByteArray, off: Int, len: Int): Int {
+        val size = sizeOf(id, ino)
+        if (pos >= size || len == 0) return 0
+        val total = minOf(len.toLong(), size - pos).toInt()
+        var done = 0
+        while (done < total) {
+            val p = pos + done
+            val c = p / CHUNK
+            val inC = (p % CHUNK).toInt()
+            val n = minOf(CHUNK - inC, total - done)
+            val src = when {
+                cc.idx == c && cc.id == id -> cc
+                rc.idx == c && rc.id == id -> rc
+                else -> {
+                    val leff = chunkLen(size, c)
+                    decodeChunk(ino, c, minOf(chunkLen(ino.size, c), leff), rc.buf)
+                    rc.id = id; rc.idx = c; rc.len = leff
+                    rc
+                }
+            }
+            System.arraycopy(src.buf, inC, dst, off + done, n)
+            done += n
+        }
+        return total
+    }
+
+    private fun writeCompressed(id: Int, pos: Long, src: ByteArray, off: Int, len: Int) {
+        if (rc.id == id) rc.idx = -1
+        val base = sizeOf(id, readInode(id))
+        val newSize = maxOf(base, pos + len)
+        if (base % CHUNK != 0L && (newSize - 1) / CHUNK > (base - 1) / CHUNK) {
+            // The old partial last chunk stops being last: make it a full, zero-padded chunk first.
+            commit()
+            val c = (base - 1) / CHUNK
+            rewriteChunk(id, c, chunkLen(readInode(id).size, c), CHUNK)
+        }
+        var done = 0
+        try {
+            while (done < len) {
+                val p = pos + done
+                val c = p / CHUNK
+                val inC = (p % CHUNK).toInt()
+                val n = minOf(CHUNK - inC, len - done)
+                val lNew = chunkLen(newSize, c)
+                if (cc.idx == c && cc.id == id) {
+                    if (lNew > cc.len) { java.util.Arrays.fill(cc.buf, cc.len, lNew, 0); cc.len = lNew }
+                } else {
+                    commit()
+                    val ino = readInode(id)
+                    if (inC == 0 && n >= lNew) java.util.Arrays.fill(cc.buf, 0, CHUNK, 0)
+                    else decodeChunk(ino, c, minOf(chunkLen(ino.size, c), lNew), cc.buf)
+                    cc.id = id; cc.idx = c; cc.len = lNew
+                    cc.pendingSize = maxOf(ino.size, c * CHUNK + lNew)
+                }
+                System.arraycopy(src, off + done, cc.buf, inC, n)
+                cc.dirty = true
+                cc.pendingSize = maxOf(cc.pendingSize, c * CHUNK + cc.len)
+                done += n
+            }
+        } catch (t: Throwable) {
+            cc.idx = -1; cc.dirty = false
+            throw t
+        }
+    }
+
+    private fun truncateCompressed(id: Int, newSize: Long) {
+        commit()
+        if (rc.id == id) rc.idx = -1
+        val old = readInode(id).size
+        if (newSize == old) return
+        if (newSize < old) {
+            if (newSize % CHUNK != 0L) {
+                val c = newSize / CHUNK
+                rewriteChunk(id, c, chunkLen(old, c), (newSize - c * CHUNK).toInt())
+            }
+            val ino = readInode(id)
+            shrink(ino, (newSize + CHUNK - 1) / CHUNK * CHUNK)
+            ino.size = newSize
+            ino.mtime = System.currentTimeMillis()
+            writeInode(id, ino)
+        } else {
+            if (old % CHUNK != 0L) {
+                val c = (old - 1) / CHUNK
+                rewriteChunk(id, c, chunkLen(old, c), chunkLen(newSize, c))
+            }
+            val ino = readInode(id)
+            ino.size = newSize
+            ino.mtime = System.currentTimeMillis()
+            writeInode(id, ino)
+        }
+        flushBitmap()
+    }
+
     // ---- allocation -------------------------------------------------------------------------
 
     private fun allocBlock(zero: Boolean): Long {
@@ -495,7 +757,7 @@ class SecFs private constructor(private val dev: BlockDevice) {
         dev.read(inodeStart + id / INODES_PER_BLOCK, buf, 0)
         val bb = ByteBuffer.wrap(buf, (id % INODES_PER_BLOCK) * INODE_SIZE, INODE_SIZE)
         val ino = Inode(bb.short.toInt() and 0xFFFF)
-        bb.position(bb.position() + 2)
+        ino.flags = bb.short.toInt() and 0xFFFF
         ino.parent = bb.int
         ino.size = bb.long
         ino.mtime = bb.long
@@ -509,7 +771,7 @@ class SecFs private constructor(private val dev: BlockDevice) {
         dev.read(blk, buf, 0)
         val bb = ByteBuffer.wrap(buf)
         bb.position((id % INODES_PER_BLOCK) * INODE_SIZE)
-        bb.putShort(ino.mode.toShort()).position(bb.position() + 2)
+        bb.putShort(ino.mode.toShort()).putShort(ino.flags.toShort())
         bb.putInt(ino.parent)
         bb.putLong(ino.size).putLong(ino.mtime)
         for (i in 0 until PTR_SLOTS) bb.putInt(ino.ptr[i])
@@ -520,7 +782,10 @@ class SecFs private constructor(private val dev: BlockDevice) {
         if (ino.mode == MODE_FREE) throw NoSuchEntryException("inode $id")
     }
 
-    private fun toStat(id: Int, ino: Inode) = Stat(id, ino.mode == MODE_DIR, ino.size, ino.mtime)
+    private fun toStat(id: Int, ino: Inode) = Stat(id, ino.mode == MODE_DIR, sizeOf(id, ino), ino.mtime)
+
+    /** Size including bytes still sitting in the write-back chunk. */
+    private fun sizeOf(id: Int, ino: Inode) = if (cc.idx >= 0 && cc.id == id) cc.pendingSize else ino.size
 
     // ---- format / open ----------------------------------------------------------------------
 
@@ -549,7 +814,7 @@ class SecFs private constructor(private val dev: BlockDevice) {
         dirtyBitmap.set(0, bitmapBlocks)
         flushBitmap()
         val sb = ByteBuffer.allocate(bs)
-        sb.put(MAGIC).putInt(1).putLong(blockCount).putInt(inodeCount)
+        sb.put(MAGIC).putInt(2).putLong(blockCount).putInt(inodeCount).putInt(compression?.id ?: NO_COMPRESSION)
         dev.write(0, sb.array(), 0)
         dev.flush()
     }
@@ -560,9 +825,14 @@ class SecFs private constructor(private val dev: BlockDevice) {
         val sb = ByteBuffer.wrap(sbBuf)
         val magic = ByteArray(MAGIC.size).also { sb.get(it) }
         if (!magic.contentEquals(MAGIC)) throw CorruptVolumeException("Volume is not formatted (or the filesystem is damaged)")
-        if (sb.int != 1) throw CorruptVolumeException("Unsupported filesystem version")
+        if (sb.int != 2) throw CorruptVolumeException("Unsupported filesystem version")
         val count = sb.long
         val inodes = sb.int
+        val compId = sb.int
+        if (compId != NO_COMPRESSION) {
+            compression = Compression.byId(compId) ?: throw CorruptVolumeException("Unknown compression engine")
+            codec = Codec.of(compression!!)
+        }
         if (count != dev.blockCount) throw CorruptVolumeException("Filesystem size mismatch")
         layout(count)
         if (inodes != inodeCount) throw CorruptVolumeException("Filesystem layout mismatch")
@@ -596,11 +866,18 @@ class SecFs private constructor(private val dev: BlockDevice) {
         private const val DIND_SLOT = 13
         private const val PTR_SLOTS = 14
         private const val MAX_FILE_BLOCKS = 12L + 1024 + 1024L * 1024
-        private val MAGIC = "SFS1".toByteArray()
+        private val MAGIC = "SFS2".toByteArray()
+        private const val NO_COMPRESSION = 255
+        private const val F_COMPRESSED = 1
+        private const val CHUNK = 65536
 
-        fun format(dev: BlockDevice): SecFs {
+        fun format(dev: BlockDevice, compression: Compression? = null): SecFs {
             require(dev.blockSize == 4096) { "unsupported block size" }
-            return SecFs(dev).also { it.doFormat() }
+            return SecFs(dev).also {
+                it.compression = compression
+                it.codec = compression?.let { c -> Codec.of(c) }
+                it.doFormat()
+            }
         }
 
         fun open(dev: BlockDevice): SecFs {
