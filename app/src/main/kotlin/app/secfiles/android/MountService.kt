@@ -104,11 +104,16 @@ class MountService : Service() {
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_lock)
             .setContentTitle(if (names.size == 1) "${names[0]} is unlocked" else "${names.size} volumes unlocked")
-            .setContentText("Available as a drive in the Files app")
-            .setContentIntent(open)
-            .setOngoing(true)
+            .setContentText("Tap or swipe to lock. Available as a drive in the Files app.")
+            // Tapping or swiping the notification locks everything. (Android 14+ lets users swipe away
+            // foreground-service notifications; on older versions only the tap works.)
+            .setContentIntent(lockIntent)
+            .setDeleteIntent(lockIntent)
+            .setAutoCancel(true)
+            .setOngoing(false)
             .setVisibility(Notification.VISIBILITY_PRIVATE)
             .addAction(Notification.Action.Builder(null, "Lock now", lockIntent).build())
+            .addAction(Notification.Action.Builder(null, "Open app", open).build())
             .build()
     }
 
