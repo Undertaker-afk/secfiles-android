@@ -89,6 +89,25 @@ class CodecTest {
     }
 
     @Test
+    fun snappyDecodesStreamsProducedByTheReferenceImplementation() {
+        for (name in listOf("text", "mixed")) {
+            val expect = resource("snappy_$name.bin")
+            val z = resource("snappy_$name.snp")
+            val out = ByteArray(expect.size)
+            Snappy.decompress(z, 0, z.size, out, expect.size)
+            assertContentEquals(expect, out, name)
+        }
+    }
+
+    @Test
+    fun snappyRejectsWrongLengthAndBadCopies() {
+        val z = Codec.of(Compression.SNAPPY).compress(samples["text"]!!, 0, 65536)
+        assertFailsWith<CorruptVolumeException> { Snappy.decompress(z, 0, z.size, ByteArray(70000), 65535) }
+        // preamble says 10 bytes, then a copy with offset 1 before anything was written
+        assertFailsWith<CorruptVolumeException> { Snappy.decompress(byteArrayOf(10, 0x0A, 1, 0), 0, 4, ByteArray(10), 10) }
+    }
+
+    @Test
     fun lz4RejectsWrongOutputLengthAndBadOffsets() {
         val z = Codec.of(Compression.LZ4).compress(samples["text"]!!, 0, 65536)
         assertFailsWith<CorruptVolumeException> { Lz4.decompress(z, 0, z.size, ByteArray(70000), 65537) }

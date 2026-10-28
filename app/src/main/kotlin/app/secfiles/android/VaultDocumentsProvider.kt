@@ -43,12 +43,13 @@ class VaultDocumentsProvider : DocumentsProvider() {
                 add(Root.COLUMN_ROOT_ID, m.entry.id)
                 add(Root.COLUMN_DOCUMENT_ID, docId(m.entry.id, m.fs.rootId))
                 add(Root.COLUMN_TITLE, m.entry.name)
-                add(Root.COLUMN_SUMMARY, "Encrypted volume (AES + Twofish + Serpent)")
+                add(Root.COLUMN_SUMMARY, "Encrypted volume")
+                add(Root.COLUMN_MIME_TYPES, "*/*")
                 add(Root.COLUMN_AVAILABLE_BYTES, free)
                 add(Root.COLUMN_ICON, R.drawable.ic_lock)
                 add(
                     Root.COLUMN_FLAGS,
-                    Root.FLAG_SUPPORTS_CREATE or Root.FLAG_SUPPORTS_IS_CHILD or Root.FLAG_LOCAL_ONLY
+                    Root.FLAG_SUPPORTS_CREATE or Root.FLAG_SUPPORTS_IS_CHILD or Root.FLAG_SUPPORTS_SEARCH or Root.FLAG_LOCAL_ONLY
                 )
             }
         }
@@ -71,6 +72,23 @@ class VaultDocumentsProvider : DocumentsProvider() {
         for (e in guarded { m.fs.list(id) }) {
             addRow(c, m, e.stat.id, e.name, null, e.stat)
         }
+        return c
+    }
+
+    override fun querySearchDocuments(rootId: String, query: String, projection: Array<out String>?): Cursor {
+        val m = mounts.get(rootId) ?: throw FileNotFoundException("Volume is locked")
+        mounts.touch()
+        val c = MatrixCursor(projection ?: DEFAULT_DOC_PROJECTION)
+        val q = query.lowercase()
+        var found = 0
+        fun walk(dir: Int) {
+            for (e in m.fs.list(dir)) {
+                if (found >= MAX_SEARCH_RESULTS) return
+                if (e.name.lowercase().contains(q)) { addRow(c, m, e.stat.id, e.name, null, e.stat); found++ }
+                if (e.stat.isDir) walk(e.stat.id)
+            }
+        }
+        guarded { walk(m.fs.rootId) }
         return c
     }
 
@@ -259,6 +277,7 @@ class VaultDocumentsProvider : DocumentsProvider() {
     }
 
     companion object {
+        private const val MAX_SEARCH_RESULTS = 200
         private val DEFAULT_ROOT_PROJECTION = arrayOf(
             Root.COLUMN_ROOT_ID, Root.COLUMN_DOCUMENT_ID, Root.COLUMN_TITLE, Root.COLUMN_SUMMARY,
             Root.COLUMN_AVAILABLE_BYTES, Root.COLUMN_ICON, Root.COLUMN_FLAGS,

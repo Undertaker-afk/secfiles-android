@@ -23,6 +23,23 @@ fun SettingsScreen(vm: MainViewModel) {
     var screenOff by remember { mutableStateOf(s.lockOnScreenOff) }
     var onLeave by remember { mutableStateOf(s.lockOnLeave) }
     var screenshots by remember { mutableStateOf(s.allowScreenshots) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var overlay by remember { mutableStateOf(s.ejectOverlay) }
+    var overlayGranted by remember { mutableStateOf(android.provider.Settings.canDrawOverlays(context)) }
+    val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(lifecycle) { // re-check after the user comes back from the system permission screen
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) overlayGranted = android.provider.Settings.canDrawOverlays(context)
+        }
+        lifecycle.addObserver(obs)
+        onDispose { lifecycle.removeObserver(obs) }
+    }
+    fun refreshOverlay() {
+        if (vm.mounts.all().isNotEmpty()) {
+            context.startService(android.content.Intent(context, app.secfiles.android.MountService::class.java)
+                .setAction(app.secfiles.android.MountService.ACTION_REFRESH))
+        }
+    }
 
     Scaffold(topBar = {
         TopAppBar(
@@ -38,18 +55,37 @@ fun SettingsScreen(vm: MainViewModel) {
                 }
             }
             HorizontalDivider()
+            SwitchRow(
+                "Eject button over other apps", overlay && overlayGranted,
+                if (overlayGranted) "A grey X at the right edge while a volume is unlocked. One tap locks everything."
+                else "Needs the 'display over other apps' permission. Turn on to grant it.",
+            ) { on ->
+                overlay = on; s.ejectOverlay = on
+                if (on && !overlayGranted) {
+                    context.startActivity(
+                        android.content.Intent(
+                            android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            android.net.Uri.parse("package:" + context.packageName),
+                        )
+                    )
+                }
+                refreshOverlay()
+            }
             SwitchRow("Lock when the screen turns off", screenOff) { screenOff = it; s.lockOnScreenOff = it }
             SwitchRow("Lock when I leave the app", onLeave, "Opening a file picker or another app counts as leaving") { onLeave = it; s.lockOnLeave = it }
             SwitchRow("Allow screenshots", screenshots, "Applies the next time the app is opened") { screenshots = it; s.allowScreenshots = it }
             HorizontalDivider()
             Text("How your data is protected", style = MaterialTheme.typography.titleSmall)
             Text(
-                "• Three independent ciphers in a cascade – AES-256, Twofish-256 and Serpent-256, each in XTS mode with its own " +
-                    "key – so the data stays protected even if one of them is ever broken.\n" +
+                "• A cascade of one to five independent ciphers, each in XTS mode with its own keys. You choose the depth; the ciphers " +
+                    "and their order are drawn from a pool of eight by a hash of your password and the container salt, and are sealed " +
+                    "in the header. This is obscurity on top of real strength, not a replacement for it.\n" +
+                    "• Optional compression happens before encryption, with one of five engines picked the same way.\n" +
                     "• Your password (and optional keyfiles) go through Argon2id, a memory-hard function that makes guessing slow and expensive.\n" +
-                    "• The container headers are authenticated with HMAC-SHA-512; a backup header is stored at the end of the file.\n" +
-                    "• Biometric unlock keeps the key in the phone's secure hardware, gated by a strong biometric, and is wiped by Android " +
-                    "if fingerprints/faces are added.\n" +
+                    "• The header is sealed with ChaCha20-Poly1305 and signed with Falcon-512, so damage or tampering is detected before any " +
+                    "password work is done. A backup header is stored at the end of the file.\n" +
+                    "• Biometric unlock is a convenience: the credential is wrapped by a hardware-backed key, kept in memory only, and expires " +
+                    "after three days.\n" +
                     "• This app has no internet permission. Keys live only in memory while a volume is unlocked.\n\n" +
                     "Limits: files you open in other apps, or export, are decrypted copies those apps control. " +
                     "A rooted or compromised phone can read keys from memory while a volume is unlocked.",

@@ -43,6 +43,14 @@ object BiometricVault {
         runCatching { keyStore().deleteEntry(alias(volumeId)) }
     }
 
+    /** Removes every volume key. Called at process start: the remember-me store lives in RAM only. */
+    fun deleteAll() {
+        runCatching {
+            val ks = keyStore()
+            ks.aliases().toList().filter { it.startsWith("secfiles.vol.") }.forEach { ks.deleteEntry(it) }
+        }
+    }
+
     private fun createKey(context: Context, volumeId: String): SecretKey {
         fun spec(strongBox: Boolean): KeyGenParameterSpec {
             val b = KeyGenParameterSpec.Builder(alias(volumeId), KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)

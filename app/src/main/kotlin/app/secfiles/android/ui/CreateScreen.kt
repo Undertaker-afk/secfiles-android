@@ -33,6 +33,8 @@ fun CreateScreen(vm: MainViewModel) {
     var keyfiles by remember { mutableStateOf(emptyList<Uri>()) }
     var external by remember { mutableStateOf(false) }
     var biometric by remember { mutableStateOf(false) }
+    var layers by remember { mutableIntStateOf(3) }
+    var compress by remember { mutableStateOf(true) }
     val kdfOptions = listOf(
         Triple("Standard", KdfParams.STANDARD, "128 MiB · quick unlock"),
         Triple("Strong", KdfParams.STRONG, "256 MiB · recommended"),
@@ -63,6 +65,7 @@ fun CreateScreen(vm: MainViewModel) {
             CreateRequest(
                 name = name.trim(), sizeBytes = size!! * 1024 * 1024, password = pw.toCharArray(), keyfiles = keyfiles,
                 kdf = kdfOptions[kdfIndex].second, location = location, enableBiometric = biometric && bioAvailable,
+                layers = layers, compress = compress,
             ),
             activity,
         )
@@ -112,6 +115,30 @@ fun CreateScreen(vm: MainViewModel) {
             pwError?.let { if (pw.isNotEmpty() || keyfiles.isNotEmpty()) Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             KeyfilePicker(keyfiles, vm::displayName) { keyfiles = it }
 
+            Text("Encryption cascade", style = MaterialTheme.typography.titleSmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                (1..5).forEach { n ->
+                    FilterChip(selected = layers == n, onClick = { layers = n }, label = { Text("$n layer" + if (n > 1) "s" else "") })
+                }
+            }
+            Text(
+                "You choose how many. Which ciphers are used, and in what order, is decided by a hash of your password " +
+                    "and this container's random salt. It is never shown, and it is sealed inside the header. More layers " +
+                    "are slower: each one adds a full pass over every block.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(compress, { compress = it })
+                Column {
+                    Text("Compress before encrypting")
+                    Text(
+                        "Saves space on text, documents and databases. The engine is picked the same hidden way. " +
+                            "Photos and video do not shrink and are stored as-is.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+
             Text("Key derivation (Argon2id)", style = MaterialTheme.typography.titleSmall)
             kdfOptions.forEachIndexed { i, (n, p, d) ->
                 val ok = memoryOk(p)
@@ -128,9 +155,9 @@ fun CreateScreen(vm: MainViewModel) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(biometric, { biometric = it })
                     Column {
-                        Text("Unlock with biometrics")
+                        Text("Remember with biometrics")
                         Text(
-                            "Wraps the key in the device's secure hardware. Your password stays the master key.",
+                            "Remembered in memory for 3 days, then your password is required again. Your password stays the master key.",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }

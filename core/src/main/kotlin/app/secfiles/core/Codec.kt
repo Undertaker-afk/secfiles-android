@@ -1,6 +1,5 @@
 package app.secfiles.core
 
-import org.iq80.snappy.Snappy
 import org.itadaki.bzip2.BZip2InputStream
 import org.itadaki.bzip2.BZip2OutputStream
 import org.tukaani.xz.LZMA2Options
@@ -122,19 +121,8 @@ private class Bzip2Codec : Codec() {
 }
 
 private class SnappyCodec : Codec() {
-    override fun compress(src: ByteArray, off: Int, len: Int): ByteArray {
-        val dst = ByteArray(Snappy.maxCompressedLength(len))
-        return dst.copyOf(Snappy.compress(src, off, len, dst, 0))
-    }
-
-    override fun decompress(src: ByteArray, off: Int, len: Int, out: ByteArray, outLen: Int) {
-        try {
-            if (Snappy.getUncompressedLength(src, off) != outLen) corrupt()
-            // The library copies in 8-byte strides and can write a few bytes past the declared length, which
-            // would clobber the caller's zero padding. Decode into a buffer with slack and copy exactly.
-            val tmp = ByteArray(outLen + 128)
-            if (Snappy.uncompress(src, off, len, tmp, 0) != outLen) corrupt()
-            System.arraycopy(tmp, 0, out, 0, outLen)
-        } catch (e: CorruptVolumeException) { throw e } catch (e: Exception) { corrupt(e) }
-    }
+    private val table = IntArray(1 shl 14)
+    override fun compress(src: ByteArray, off: Int, len: Int): ByteArray = Snappy.compress(src, off, len, table)
+    override fun decompress(src: ByteArray, off: Int, len: Int, out: ByteArray, outLen: Int) =
+        Snappy.decompress(src, off, len, out, outLen)
 }

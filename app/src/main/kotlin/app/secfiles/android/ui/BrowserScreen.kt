@@ -12,7 +12,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
@@ -78,7 +80,7 @@ fun BrowserScreen(vm: MainViewModel, volumeId: String) {
                 },
                 navigationIcon = {
                     IconButton(onClick = { if (vm.canGoUp) vm.goUp() else vm.screen = Screen.List }) {
-                        Icon(Icons.Default.ArrowBack, "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
                     }
                 },
                 actions = {
@@ -148,7 +150,11 @@ private fun EntryRow(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(if (e.stat.isDir) "📁" else "📄", style = MaterialTheme.typography.headlineSmall)
+        Icon(
+            if (e.stat.isDir) Icons.Default.Folder else Icons.AutoMirrored.Filled.InsertDriveFile, null,
+            tint = if (e.stat.isDir) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(28.dp),
+        )
         Spacer(Modifier.width(16.dp))
         Column(Modifier.weight(1f)) {
             Text(e.name, maxLines = 1, overflow = TextOverflow.Ellipsis)

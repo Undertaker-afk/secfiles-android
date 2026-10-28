@@ -2,22 +2,18 @@ package app.secfiles.android
 
 import android.content.Context
 import android.net.Uri
-import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
-/** A container the app knows about. Holds no secrets except the keystore-wrapped biometric blob. */
+/** A container the app knows about. Holds no secrets of any kind. */
 data class VolumeEntry(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
     val uri: String,
     val sizeBytes: Long,
     val inAppStorage: Boolean,
-    val wrappedSecret: ByteArray? = null,
-    val wrappedIv: ByteArray? = null,
 ) {
-    val biometricEnabled get() = wrappedSecret != null && wrappedIv != null
     val parsedUri: Uri get() = Uri.parse(uri)
     override fun equals(other: Any?) = other is VolumeEntry && other.id == id
     override fun hashCode() = id.hashCode()
@@ -38,8 +34,6 @@ class VolumeRegistry(context: Context) {
                     uri = o.getString("uri"),
                     sizeBytes = o.optLong("size"),
                     inAppStorage = o.optBoolean("inApp"),
-                    wrappedSecret = o.optString("ws").takeIf { it.isNotEmpty() }?.let { Base64.decode(it, Base64.NO_WRAP) },
-                    wrappedIv = o.optString("wi").takeIf { it.isNotEmpty() }?.let { Base64.decode(it, Base64.NO_WRAP) },
                 )
             }.getOrNull()
         }
@@ -52,10 +46,6 @@ class VolumeRegistry(context: Context) {
             arr.put(JSONObject().apply {
                 put("id", e.id); put("name", e.name); put("uri", e.uri); put("size", e.sizeBytes)
                 put("inApp", e.inAppStorage)
-                if (e.biometricEnabled) {
-                    put("ws", Base64.encodeToString(e.wrappedSecret, Base64.NO_WRAP))
-                    put("wi", Base64.encodeToString(e.wrappedIv, Base64.NO_WRAP))
-                }
             })
         }
         prefs.edit().putString("list", arr.toString()).apply()
@@ -82,4 +72,9 @@ class Settings(context: Context) {
     var allowScreenshots: Boolean
         get() = prefs.getBoolean("allowScreenshots", false)
         set(v) = prefs.edit().putBoolean("allowScreenshots", v).apply()
+
+    /** Draw a small eject button over other apps while a volume is unlocked (needs the overlay permission). */
+    var ejectOverlay: Boolean
+        get() = prefs.getBoolean("ejectOverlay", true)
+        set(v) = prefs.edit().putBoolean("ejectOverlay", v).apply()
 }

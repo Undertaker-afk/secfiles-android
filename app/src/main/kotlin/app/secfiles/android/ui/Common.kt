@@ -5,6 +5,8 @@ import android.net.Uri
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -65,7 +67,11 @@ fun KeyfilePicker(files: List<Uri>, names: (Uri) -> String, onChange: (List<Uri>
             )
         }
         files.forEach { f ->
-            AssistChip(onClick = { onChange(files - f) }, label = { Text("✕  " + names(f), maxLines = 1) })
+            AssistChip(
+                onClick = { onChange(files - f) },
+                label = { Text(names(f), maxLines = 1) },
+                trailingIcon = { Icon(Icons.Default.Close, "Remove keyfile", Modifier.size(16.dp)) },
+            )
         }
     }
 }

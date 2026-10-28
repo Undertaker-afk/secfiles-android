@@ -97,7 +97,7 @@ private fun EmptyState(modifier: Modifier) {
         Text("No encrypted volumes yet", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(8.dp))
         Text(
-            "Create a container protected by an AES-256 → Twofish → Serpent cascade and an Argon2id-hardened password. " +
+            "Create a container protected by a cascade of up to five ciphers and an Argon2id-hardened password. " +
                 "While it is unlocked it appears as a drive in your Files app.",
             style = MaterialTheme.typography.bodyMedium,
         )
@@ -106,6 +106,8 @@ private fun EmptyState(modifier: Modifier) {
 
 @Composable
 private fun VolumeCard(vm: MainViewModel, e: VolumeEntry, isMounted: Boolean, onClick: () -> Unit) {
+    val rememberedIds by vm.mounts.rememberedIds.collectAsState()
+    val bio = e.id in rememberedIds && vm.mounts.isRemembered(e.id)
     var menu by remember { mutableStateOf(false) }
     var dialog by remember { mutableStateOf<String?>(null) }
     Card(
@@ -122,7 +124,7 @@ private fun VolumeCard(vm: MainViewModel, e: VolumeEntry, isMounted: Boolean, on
                     buildString {
                         append(formatSize(e.sizeBytes))
                         append(if (e.inAppStorage) " · app storage" else " · external file")
-                        if (e.biometricEnabled) append(" · biometric")
+                        if (bio) append(" · biometric active")
                     },
                     style = MaterialTheme.typography.bodySmall,
                 )
@@ -140,8 +142,8 @@ private fun VolumeCard(vm: MainViewModel, e: VolumeEntry, isMounted: Boolean, on
                         DropdownMenuItem(text = { Text("Lock") }, onClick = { menu = false; vm.lock(e.id) })
                         DropdownMenuItem(text = { Text("Change password") }, onClick = { menu = false; dialog = "password" })
                     }
-                    if (e.biometricEnabled) {
-                        DropdownMenuItem(text = { Text("Disable biometric unlock") }, onClick = { menu = false; vm.disableBiometric(e) })
+                    if (bio) {
+                        DropdownMenuItem(text = { Text("Forget biometric unlock") }, onClick = { menu = false; vm.disableBiometric(e) })
                     }
                     DropdownMenuItem(text = { Text("Rename") }, onClick = { menu = false; dialog = "rename" })
                     DropdownMenuItem(text = { Text("Remove from list") }, onClick = { menu = false; dialog = "remove" })
@@ -203,12 +205,13 @@ fun UnlockDialog(vm: MainViewModel, entry: VolumeEntry, activity: FragmentActivi
     var keyfiles by remember { mutableStateOf(emptyList<android.net.Uri>()) }
     var enableBio by remember { mutableStateOf(false) }
     val bioAvailable = remember { BiometricVault.isAvailable(activity) }
-    val canEnableBio = bioAvailable && !entry.biometricEnabled
+    val bioActive = remember(entry.id) { vm.mounts.isRemembered(entry.id) }
+    val canEnableBio = bioAvailable && !bioActive
     val working = vm.busy != null
 
     // Offer the fingerprint/face prompt straight away when it is set up.
     LaunchedEffect(entry.id) {
-        if (entry.biometricEnabled && bioAvailable) vm.unlockWithBiometric(entry, activity) { ok -> if (ok) onDismiss() }
+        if (bioActive && bioAvailable) vm.unlockWithBiometric(entry, activity) { ok -> if (ok) onDismiss() }
     }
 
     AlertDialog(
@@ -218,7 +221,7 @@ fun UnlockDialog(vm: MainViewModel, entry: VolumeEntry, activity: FragmentActivi
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 PasswordField(pw, { pw = it }, "Password", enabled = !working)
                 KeyfilePicker(keyfiles, vm::displayName) { keyfiles = it }
-                if (entry.biometricEnabled && bioAvailable) {
+                if (bioActive && bioAvailable) {
                     OutlinedButton(onClick = { vm.unlockWithBiometric(entry, activity) { ok -> if (ok) onDismiss() } }) {
                         Text("Use biometrics")
                     }
@@ -226,7 +229,10 @@ fun UnlockDialog(vm: MainViewModel, entry: VolumeEntry, activity: FragmentActivi
                 if (canEnableBio) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(enableBio, { enableBio = it })
-                        Text("Enable biometric unlock on this device", style = MaterialTheme.typography.bodyMedium)
+                        Column {
+                            Text("Remember with biometrics for 3 days", style = MaterialTheme.typography.bodyMedium)
+                            Text("Kept in memory only; cleared on restart or reboot", style = MaterialTheme.typography.bodySmall)
+                        }
                     }
                 }
             }

@@ -12,6 +12,9 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 
+/** A biometric-wrapped credential held in RAM only, valid until [passwordAt] + the remember window. */
+class Remembered(val wrapped: BiometricVault.Wrapped, val passwordAt: Long)
+
 class Mounted(val entry: VolumeEntry, val volume: Volume, val device: CachedBlockDevice, val fs: SecFs)
 
 /**
@@ -22,6 +25,38 @@ class MountManager(private val context: Context) {
     private val mounted = ConcurrentHashMap<String, Mounted>()
     private val _mountedIds = MutableStateFlow<Set<String>>(emptySet())
     val mountedIds: StateFlow<Set<String>> = _mountedIds
+
+    private val remembered = ConcurrentHashMap<String, Remembered>()
+    private val _rememberedIds = MutableStateFlow<Set<String>>(emptySet())
+    val rememberedIds: StateFlow<Set<String>> = _rememberedIds
+
+    /**
+     * Stores a biometric-wrapped credential for [volumeId]. It is never written to disk: it disappears
+     * when the process dies or the device reboots, and after [REMEMBER_MS] since the password was typed
+     * the password is required again.
+     */
+    fun remember(volumeId: String, wrapped: BiometricVault.Wrapped) {
+        remembered[volumeId] = Remembered(wrapped, System.currentTimeMillis())
+        _rememberedIds.value = remembered.keys.toSet()
+    }
+
+    /** The wrapped credential, or null if none or if the remember window has expired. */
+    fun rememberedFor(volumeId: String): BiometricVault.Wrapped? {
+        val r = remembered[volumeId] ?: return null
+        if (System.currentTimeMillis() - r.passwordAt > REMEMBER_MS) {
+            forget(volumeId)
+            return null
+        }
+        return r.wrapped
+    }
+
+    fun isRemembered(volumeId: String) = rememberedFor(volumeId) != null
+
+    fun forget(volumeId: String) {
+        remembered.remove(volumeId)
+        BiometricVault.delete(volumeId)
+        _rememberedIds.value = remembered.keys.toSet()
+    }
 
     @Volatile
     private var lastActivity = System.currentTimeMillis()
@@ -80,6 +115,7 @@ class MountManager(private val context: Context) {
             m.fs.flush()
         } catch (_: Throwable) {
         }
+        m.fs.wipe()
         m.device.wipe()
         m.volume.close()
         publish()
@@ -114,5 +150,10 @@ class MountManager(private val context: Context) {
             if (uri.scheme == "file") File(uri.path!!).delete()
             else DocumentsContract.deleteDocument(context.contentResolver, uri)
         }.getOrDefault(false)
+    }
+
+    companion object {
+        /** How long a biometric unlock may stand in for the password. */
+        const val REMEMBER_MS = 3L * 24 * 60 * 60 * 1000
     }
 }

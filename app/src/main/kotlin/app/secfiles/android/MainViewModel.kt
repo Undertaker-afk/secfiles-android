@@ -36,6 +36,9 @@ class CreateRequest(
     val kdf: KdfParams,
     val location: Uri?, // null = app-private storage
     val enableBiometric: Boolean,
+    /** Cascade depth 1..5. Which ciphers and in what order is decided by the password hash, not the user. */
+    val layers: Int,
+    val compress: Boolean,
 )
 
 class MainViewModel(private val app: Application) : AndroidViewModel(app) {
@@ -118,11 +121,14 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun unlockWithBiometric(entry: VolumeEntry, activity: FragmentActivity, onDone: (Boolean) -> Unit) {
-        val wrapped = BiometricVault.Wrapped(entry.wrappedSecret ?: return, entry.wrappedIv ?: return)
+        val wrapped = mounts.rememberedFor(entry.id) ?: run {
+            message = "Biometric unlock has expired. Enter your password."
+            onDone(false); return
+        }
         BiometricVault.unwrap(activity, entry.id, entry.name, wrapped) { r ->
             r.onFailure {
                 if (it is BiometricVault.CancelledAuth && it.userCancelled) return@onFailure
-                if (it is BiometricVault.Invalidated) disableBiometric(entry)
+                if (it is BiometricVault.Invalidated) mounts.forget(entry.id)
                 message = it.message ?: "Biometric unlock failed"
             }.onSuccess { secret ->
                 busy = Busy("Unlocking ${entry.name}", "Deriving keys. This is deliberately slow.")
@@ -147,8 +153,8 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         BiometricVault.enroll(activity, entry.id, entry.name, secret) { r ->
             secret.fill(0)
             r.onSuccess { w ->
-                entry(entry.id)?.let { replace(it.copy(wrappedSecret = w.ciphertext, wrappedIv = w.iv)) }
-                message = "Biometric unlock enabled"
+                mounts.remember(entry.id, w)
+                message = "Biometric unlock enabled for 3 days (until restart)"
             }.onFailure {
                 BiometricVault.delete(entry.id)
                 if (!(it is BiometricVault.CancelledAuth && it.userCancelled)) message = it.message ?: "Could not enable biometrics"
@@ -156,10 +162,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun disableBiometric(entry: VolumeEntry) {
-        BiometricVault.delete(entry.id)
-        entry(entry.id)?.let { replace(it.copy(wrappedSecret = null, wrappedIv = null)) }
-    }
+    fun disableBiometric(entry: VolumeEntry) = mounts.forget(entry.id)
 
     fun lock(volumeId: String) {
         viewModelScope.launch(Dispatchers.IO) { mounts.unmount(volumeId) }
@@ -193,13 +196,13 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                     try {
                         pfd = app.contentResolver.openFileDescriptor(uri, "rw") ?: throw IOException("Cannot create container file")
                         val raw = FdRandomAccess(pfd)
-                        val vol = Volume.create(raw, req.sizeBytes, creds, req.kdf) { p ->
+                        val vol = Volume.create(raw, req.sizeBytes, creds, req.kdf, req.layers, req.compress) { p ->
                             if (cancelled.get()) throw CancelledException()
                             busy = Busy("Creating ${req.name}", "Filling with random data", p.toFloat()) { cancelled.set(true) }
                         }
                         busy = Busy("Creating ${req.name}", "Formatting")
                         val dev = CachedBlockDevice(vol)
-                        val fs = SecFs.format(dev)
+                        val fs = SecFs.format(dev, vol.structure.compression)
                         fs.flush()
                         val entry = VolumeEntry(
                             name = req.name, uri = uri.toString(), sizeBytes = req.sizeBytes,
@@ -250,7 +253,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     fun remove(entry: VolumeEntry, deleteFile: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
             mounts.unmount(entry.id)
-            BiometricVault.delete(entry.id)
+            mounts.forget(entry.id)
             val ok = !deleteFile || mounts.deleteContainerFile(entry)
             withContext(Dispatchers.Main) {
                 saveVolumes(volumes.filter { it.id != entry.id })
@@ -276,7 +279,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             }
             busy = null
             r.onSuccess {
-                // The biometric blob wraps the old secret and is now useless.
+                // The remembered credential wraps the old secret and is now useless.
                 disableBiometric(entry)
                 message = "Password changed. Re-enable biometric unlock if you use it."
             }.onFailure { message = describe(it) }
@@ -374,6 +377,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                                 ) { cancelled.set(true) }
                             }
                         }
+                        m.fs.flush() // compressed volumes buffer the last chunk; surface a full-volume error here
                     } catch (e: Throwable) {
                         // Never leave a truncated copy behind.
                         created?.let { runCatching { m.fs.delete(dir, it) } }
