@@ -45,7 +45,7 @@ class SecFs private constructor(private val dev: BlockDevice) {
     private var allocHint = 0L
     private var justAllocated = false
 
-    private class Inode(var mode: Int = 0, var size: Long = 0, var mtime: Long = 0) {
+    private class Inode(var mode: Int = 0, var size: Long = 0, var mtime: Long = 0, var parent: Int = 0) {
         val ptr = IntArray(PTR_SLOTS)
     }
 
@@ -65,6 +65,15 @@ class SecFs private constructor(private val dev: BlockDevice) {
     @Synchronized
     fun list(dirId: Int): List<DirEntry> =
         readDir(dirId).map { (name, id) -> DirEntry(name, toStat(id, readInode(id))) }
+
+    /** Directory that contains [id] (the root is its own parent). */
+    @Synchronized
+    fun parentOf(id: Int): Int = if (id == ROOT) ROOT else readInode(id).parent
+
+    /** File name of [id] within its parent; null for the root. */
+    @Synchronized
+    fun nameOf(id: Int): String? =
+        if (id == ROOT) null else readDir(readInode(id).parent).firstOrNull { it.second == id }?.first
 
     @Synchronized
     fun lookup(dirId: Int, name: String): Int? = readDir(dirId).firstOrNull { it.first == name }?.second
@@ -185,6 +194,7 @@ class SecFs private constructor(private val dev: BlockDevice) {
         writeDir(dstDir, dst)
         src.removeAt(i)
         writeDir(srcDir, src)
+        writeInode(id, readInode(id).also { it.parent = dstDir })
     }
 
     @Synchronized
@@ -247,7 +257,7 @@ class SecFs private constructor(private val dev: BlockDevice) {
         val entries = readDir(dirId).toMutableList()
         if (entries.any { it.first == name }) throw AlreadyExistsException(name)
         val id = allocInode()
-        val ino = Inode(mode, 0, System.currentTimeMillis())
+        val ino = Inode(mode, 0, System.currentTimeMillis(), dirId)
         writeInode(id, ino)
         entries.add(name to id)
         try {
@@ -485,7 +495,8 @@ class SecFs private constructor(private val dev: BlockDevice) {
         dev.read(inodeStart + id / INODES_PER_BLOCK, buf, 0)
         val bb = ByteBuffer.wrap(buf, (id % INODES_PER_BLOCK) * INODE_SIZE, INODE_SIZE)
         val ino = Inode(bb.short.toInt() and 0xFFFF)
-        bb.position(bb.position() + 6)
+        bb.position(bb.position() + 2)
+        ino.parent = bb.int
         ino.size = bb.long
         ino.mtime = bb.long
         for (i in 0 until PTR_SLOTS) ino.ptr[i] = bb.int
@@ -498,7 +509,8 @@ class SecFs private constructor(private val dev: BlockDevice) {
         dev.read(blk, buf, 0)
         val bb = ByteBuffer.wrap(buf)
         bb.position((id % INODES_PER_BLOCK) * INODE_SIZE)
-        bb.putShort(ino.mode.toShort()).position(bb.position() + 6)
+        bb.putShort(ino.mode.toShort()).position(bb.position() + 2)
+        bb.putInt(ino.parent)
         bb.putLong(ino.size).putLong(ino.mtime)
         for (i in 0 until PTR_SLOTS) bb.putInt(ino.ptr[i])
         dev.write(blk, buf, 0)
@@ -532,7 +544,7 @@ class SecFs private constructor(private val dev: BlockDevice) {
         inodeUsed = BitSet(inodeCount)
         inodeUsed.set(0)
         inodeUsed.set(ROOT)
-        writeInode(ROOT, Inode(MODE_DIR, 0, System.currentTimeMillis()))
+        writeInode(ROOT, Inode(MODE_DIR, 0, System.currentTimeMillis(), ROOT))
         // Mark every bitmap block dirty so the whole (random-initialised) bitmap area is written.
         dirtyBitmap.set(0, bitmapBlocks)
         flushBitmap()

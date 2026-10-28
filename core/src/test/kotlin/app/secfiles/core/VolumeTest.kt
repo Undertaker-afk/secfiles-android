@@ -90,6 +90,29 @@ class VolumeTest {
     }
 
     @Test
+    fun bitFlipInPrimaryBodyFallsBackToBackup() {
+        val raw = newRaw()
+        Volume.create(raw, dataSize, cred("pw"), fast).close()
+        val b = ByteArray(1).also { raw.read(200, it, 0, 1) }
+        raw.write(200, byteArrayOf((b[0] + 1).toByte()), 0, 1)
+        Volume.open(raw, cred("pw")).close()
+    }
+
+    @Test
+    fun wrongPasswordOnIntactHeaderDoesNotTryBackup() {
+        val raw = newRaw()
+        Volume.create(raw, dataSize, cred("pw"), fast).close()
+        // Make the backup a different, valid container header protected by another password: if the
+        // opener (wrongly) fell through to it, the "other" password would succeed against the primary.
+        val other = MemoryRandomAccess(Volume.totalFileSize(dataSize))
+        Volume.create(other, dataSize, cred("other"), fast).close()
+        val backup = ByteArray(4096).also { other.read(other.size - 4096, it, 0, 4096) }
+        raw.write(raw.size - 4096, backup, 0, 4096)
+        assertFailsWith<WrongPasswordException> { Volume.open(raw, cred("other")) }
+        Volume.open(raw, cred("pw")).close()
+    }
+
+    @Test
     fun hostileKdfParametersAreRefused() {
         val raw = newRaw()
         Volume.create(raw, dataSize, cred("pw"), fast).close()

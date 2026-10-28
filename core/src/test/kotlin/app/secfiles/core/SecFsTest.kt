@@ -105,6 +105,11 @@ class SecFsTest {
         f.move(b, "g.txt", f.rootId, "moved.txt")
         assertEquals(file, f.lookup(f.rootId, "moved.txt"))
         assertNull(f.lookup(b, "g.txt"))
+        assertEquals(f.rootId, f.parentOf(f.rootId))
+        assertEquals("moved.txt", f.nameOf(file))
+        assertEquals(f.rootId, f.parentOf(file))
+        assertEquals(a, f.parentOf(b))
+        assertNull(f.nameOf(f.rootId))
         assertFailsWith<FsException> { f.move(f.rootId, "a", b, "a") } // folder into its own child
         assertFailsWith<AlreadyExistsException> { f.createDir(f.rootId, "a") }
         assertFailsWith<AlreadyExistsException> { f.rename(f.rootId, "moved.txt", "a") }

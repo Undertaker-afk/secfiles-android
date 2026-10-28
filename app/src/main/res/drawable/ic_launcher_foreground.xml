@@ -1,0 +1,13 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- padlock body -->
+    <path android:fillColor="#4FC3F7"
+        android:pathData="M36,50h36a4,4 0 0 1 4,4v24a4,4 0 0 1 -4,4H36a4,4 0 0 1 -4,-4V54a4,4 0 0 1 4,-4z" />
+    <!-- shackle -->
+    <path android:strokeColor="#4FC3F7" android:strokeWidth="6" android:fillColor="#00000000"
+        android:pathData="M42,50V40a12,12 0 0 1 24,0v10" />
+    <!-- keyhole -->
+    <path android:fillColor="#0F1B2D"
+        android:pathData="M54,60a4,4 0 0 1 2,7.5V74h-4v-6.5A4,4 0 0 1 54,60z" />
+</vector>

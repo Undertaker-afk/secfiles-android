@@ -23,7 +23,8 @@ class CancelledException : IOException("Cancelled")
  *     24  salt (64)
  *     88  body (512) : encrypted with the AES>Twofish>Serpent cascade keyed from Argon2id output [0,192)
  *     600 HMAC-SHA-512 over bytes [0,600) keyed with Argon2id output [192,256)
- *     664 random padding to 4096
+ *     664 CRC-32 of bytes [0,664) (lets us tell "wrong password" from "damaged header" without a second KDF run)
+ *     668 random padding to 4096
  *
  * Body plaintext: "SFCBODY1" | version u32 | sector size u32 | data size u64 | created ms u64 |
  * master keys (192) | random padding.
@@ -100,7 +101,7 @@ class Volume private constructor(
         private const val BODY_LEN = 512
         private const val OFF_MAC = OFF_BODY + BODY_LEN
         private const val MAC_LEN = 64
-        private const val HEADER_USED = OFF_MAC + MAC_LEN
+        private const val OFF_CRC = OFF_MAC + MAC_LEN
         private val DERIVED_LEN = Cascade.KEY_MATERIAL_BYTES + 64
 
         fun totalFileSize(dataSize: Long) = HEADER_SIZE + dataSize + HEADER_SIZE
@@ -144,7 +145,13 @@ class Volume private constructor(
             val primary = ByteArray(HEADER_SIZE.toInt()).also { raw.read(0, it, 0, it.size) }
             val backup = ByteArray(HEADER_SIZE.toInt()).also { raw.read(size - HEADER_SIZE, it, 0, it.size) }
             for (h in listOf(primary, backup)) {
-                val parsed = parseHeader(h, credentials) ?: continue
+                val parsed = parseHeader(h, credentials)
+                if (parsed == null) {
+                    // An intact header that fails authentication means a wrong password; only a damaged
+                    // one is worth a second (expensive) attempt with the backup copy.
+                    if (crcOk(h)) throw WrongPasswordException()
+                    continue
+                }
                 val expected = HEADER_SIZE + parsed.dataSize + HEADER_SIZE
                 if (parsed.dataSize % SECTOR_SIZE != 0L || expected > size) {
                     parsed.keys.fill(0)
@@ -178,6 +185,7 @@ class Volume private constructor(
                 System.arraycopy(body, 0, h, OFF_BODY, BODY_LEN)
                 val mac = hmac(derived.copyOfRange(Cascade.KEY_MATERIAL_BYTES, DERIVED_LEN), h, 0, OFF_MAC)
                 System.arraycopy(mac, 0, h, OFF_MAC, MAC_LEN)
+                ByteBuffer.wrap(h).putInt(OFF_CRC, crc(h))
             } finally {
                 derived.fill(0)
                 body.fill(0)
@@ -218,6 +226,11 @@ class Volume private constructor(
             raw.write(0, header, 0, header.size)
             raw.write(totalSize - HEADER_SIZE, header, 0, header.size)
         }
+
+        private fun crc(h: ByteArray): Int =
+            java.util.zip.CRC32().also { it.update(h, 0, OFF_CRC) }.value.toInt()
+
+        private fun crcOk(h: ByteArray) = ByteBuffer.wrap(h).getInt(OFF_CRC) == crc(h)
 
         private fun hmac(key: ByteArray, data: ByteArray, off: Int, len: Int): ByteArray {
             val m = Mac.getInstance("HmacSHA512")
